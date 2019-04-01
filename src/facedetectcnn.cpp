@@ -37,11 +37,14 @@ the use of this software, even if advised of the possibility of such damage.
 */
 
 #include "facedetectcnn.h"
+#include <iostream>
+#include <sstream>
 #include <string.h>
 #include <cmath>
 #include <vector>
 #include <float.h> //for FLT_EPSION
 #include <algorithm>//for stable_sort, sort
+using namespace std;
 
 #if defined( __WIN__) || defined(_WINDOWS)
 #define SSE_256ELEMENT(vec, idx) vec.m256_f32[(idx)]
@@ -1308,3 +1311,259 @@ bool detection_output(const CDataBlob * priorbox, const CDataBlob * loc, const C
     return true;
 }
 
+
+void CDataBlob::setNULL()
+{
+	if (data_float)
+		myFree(&data_float);
+	if (data_int8)
+		myFree(&data_int8);
+	width = height = channels = floatChannelStepInByte = int8ChannelStepInByte = 0;
+	int8float_scale = 1.0f;
+	int8_data_valid = false;
+}
+
+bool CDataBlob::create(int w, int h, int c)
+{
+	setNULL();
+
+	width = w;
+	height = h;
+	channels = c;
+	//alloc space for float array
+	int remBytes = (sizeof(float)* channels) % (_MALLOC_ALIGN / 8);
+	if (remBytes == 0)
+		floatChannelStepInByte = channels * sizeof(float);
+	else
+		floatChannelStepInByte = (channels * sizeof(float)) + (_MALLOC_ALIGN / 8) - remBytes;
+	data_float = (float*)myAlloc(width * height * floatChannelStepInByte);
+
+	//alloc space for int8 array
+	remBytes = (sizeof(char)* channels) % (_MALLOC_ALIGN / 8);
+	if (remBytes == 0)
+		int8ChannelStepInByte = channels * sizeof(char);
+	else
+		int8ChannelStepInByte = (channels * sizeof(char)) + (_MALLOC_ALIGN / 8) - remBytes;
+	data_int8 = (signed char*)myAlloc(width * height * int8ChannelStepInByte);
+
+	if (data_float == NULL)
+	{
+		cerr << "Cannot alloc memeory for float data blob: "
+			<< width << "*"
+			<< height << "*"
+			<< channels << endl;
+		return false;
+	}
+
+	if (data_int8 == NULL)
+	{
+		cerr << "Cannot alloc memeory for uint8 data blob: "
+			<< width << "*"
+			<< height << "*"
+			<< channels << endl;
+		return false;
+	}
+
+	//memset(data_float, 0, width * height * floatChannelStepInByte);
+	//memset(data_int8, 0, width * height * int8ChannelStepInByte);
+
+	//the following code is faster than memset
+	//but not only the padding bytes are set to zero.
+	//BE CAREFUL!!!
+//#if defined(_OPENMP)
+//#pragma omp parallel for
+//#endif
+	for (int r = 0; r < this->height; r++)
+	{
+		for (int c = 0; c < this->width; c++)
+		{
+			int pixel_end = this->floatChannelStepInByte / sizeof(float);
+			float * pF = (float*)(this->data_float + (r * this->width + c) * this->floatChannelStepInByte / sizeof(float));
+			for (int ch = this->channels; ch < pixel_end; ch++)
+				pF[ch] = 0;
+
+			pixel_end = this->int8ChannelStepInByte / sizeof(char);
+			char * pI = (char*)(this->data_int8 + (r * this->width + c) * this->int8ChannelStepInByte / sizeof(char));
+			for (int ch = this->channels; ch < pixel_end; ch++)
+				pI[ch] = 0;
+		}
+	}
+
+	return true;
+}
+
+bool CDataBlob::setInt8DataFromCaffeFormat(signed char * pData, int dataWidth, int dataHeight, int dataChannels)
+{
+	if (pData == NULL)
+	{
+		cerr << "The input image data is null." << endl;
+		return false;
+	}
+	if (dataWidth != this->width ||
+		dataHeight != this->height ||
+		dataChannels != this->channels)
+	{
+		cerr << "The dim of the data can not match that of the Blob." << endl;
+		return false;
+	}
+	//create(dataWidth, dataHeight, dataChannels);
+
+	for (int row = 0; row < height; row++)
+		for (int col = 0; col < width; col++)
+		{
+			signed char * p = (this->data_int8 + (width * row + col) * int8ChannelStepInByte / sizeof(char));
+			for (int ch = 0; ch < channels; ch++)
+			{
+				p[ch] = pData[ch * height * width + row * width + col];
+			}
+		}
+	return true;
+}
+
+bool CDataBlob::setFloatDataFromCaffeFormat(float * pData, int dataWidth, int dataHeight, int dataChannels)
+{
+	if (pData == NULL)
+	{
+		cerr << "The input image data is null." << endl;
+		return false;
+	}
+	if (dataWidth != this->width ||
+		dataHeight != this->height ||
+		dataChannels != this->channels)
+	{
+		cerr << "The dim of the data can not match that of the Blob." << endl;
+		return false;
+	}
+	//create(dataWidth, dataHeight, dataChannels);
+
+	for (int row = 0; row < height; row++)
+		for (int col = 0; col < width; col++)
+		{
+			float * p = (this->data_float + (width * row + col) * floatChannelStepInByte / sizeof(float));
+			for (int ch = 0; ch < channels; ch++)
+			{
+				p[ch] = pData[ch * height * width + row * width + col];
+			}
+		}
+	return true;
+}
+
+bool CDataBlob::setDataFromImage(const unsigned char * imgData, int imgWidth, int imgHeight, int imgChannels, int imgWidthStep, int * pChannelMean)
+{
+	if (imgData == NULL)
+	{
+		cerr << "The input image data is null." << endl;
+		return false;
+	}
+	if (pChannelMean == NULL)
+	{
+		cerr << "The mean values is null." << endl;
+		return false;
+	}
+	create(imgWidth, imgHeight, imgChannels);
+
+	//#if defined(_OPENMP)
+	//#pragma omp parallel for
+	//#endif
+	for (int r = 0; r < imgHeight; r++)
+	{
+		for (int c = 0; c < imgWidth; c++)
+		{
+			const unsigned char * pImgData = imgData + imgWidthStep * r + imgChannels * c;
+			float * pBlobData = this->data_float + (this->width * r + c) * this->floatChannelStepInByte / sizeof(float);
+			for (int ch = 0; ch < imgChannels; ch++)
+				pBlobData[ch] = (float)(pImgData[ch] - pChannelMean[ch]);
+		}
+	}
+	return true;
+}
+
+bool CDataBlob::setDataFrom3x3S2P1to1x1S1P0FromImage(const unsigned char * imgData, int imgWidth, int imgHeight, int imgChannels, int imgWidthStep, int * pChannelMean)
+{
+	if (imgData == NULL)
+	{
+		cerr << "The input image data is null." << endl;
+		return false;
+	}
+	if (pChannelMean == NULL)
+	{
+		cerr << "The mean values is null." << endl;
+		return false;
+	}
+	if (imgChannels != 3)
+	{
+		cerr << "The input image must be a 3-channel RGB image." << endl;
+		return false;
+	}
+
+	create((imgWidth + 1) / 2, (imgHeight + 1) / 2, 27);
+	//since the pixel assignment cannot fill all the elements in the blob. 
+	//some elements in the blob should be initialized to 0
+	memset(data_float, 0, width * height * floatChannelStepInByte);
+
+#if defined(_OPENMP)
+#pragma omp parallel for
+#endif
+	for (int r = 0; r < this->height; r++)
+	{
+		for (int c = 0; c < this->width; c++)
+		{
+			float * pData = this->data_float + (r * this->width + c) * this->floatChannelStepInByte / sizeof(float);
+			for (int fy = -1; fy <= 1; fy++)
+			{
+				int srcy = r * 2 + fy;
+
+				if (srcy < 0 || srcy >= imgHeight) //out of the range of the image
+					continue;
+
+				for (int fx = -1; fx <= 1; fx++)
+				{
+					int srcx = c * 2 + fx;
+
+					if (srcx < 0 || srcx >= imgWidth) //out of the range of the image
+						continue;
+
+					const unsigned char * pImgData = imgData + imgWidthStep * srcy + imgChannels * srcx;
+
+					int output_channel_offset = ((fy + 1) * 3 + fx + 1) * 3; //3x3 filters, 3-channel image
+
+					pData[output_channel_offset] = (float)(pImgData[0] - pChannelMean[0]);
+					pData[output_channel_offset + 1] = (float)(pImgData[1] - pChannelMean[1]);
+					pData[output_channel_offset + 2] = (float)(pImgData[2] - pChannelMean[2]);
+
+				}
+
+			}
+		}
+	}
+	return true;
+}
+
+
+std::string CDataBlob::str() const
+{
+	std::ostringstream output;
+	output << "DataBlob Size (Width, Height, Channel) = ("
+		<< width
+		<< ", " << height
+		<< ", " << channels
+		<< ")" << std::endl;
+	for (int ch = 0; ch < channels; ch++)
+	{
+		output << "Channel " << ch << ": " << std::endl;
+
+		for (int row = 0; row < height; row++)
+		{
+			output << "(";
+			for (int col = 0; col < width; col++)
+			{
+				float * p = (data_float + (width * row + col) * floatChannelStepInByte / sizeof(float));
+				output << p[ch];
+				if (col != width - 1)
+					output << ", ";
+			}
+			output << ")" << std::endl;
+		}
+	}
+	return output.str();
+}
